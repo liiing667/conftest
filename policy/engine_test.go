@@ -1,6 +1,8 @@
 package policy
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -8,13 +10,16 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/fstest"
 
+	"github.com/open-policy-agent/conftest/output"
 	"github.com/open-policy-agent/conftest/parser"
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/loader"
+	"github.com/owenrumney/go-sarif/v2/sarif"
 )
 
 func testOptions(t *testing.T) CompilerOptions {
@@ -749,4 +754,118 @@ deny_not_twohundred contains msg if {
 			t.Errorf("expected %d request with the cache enabled, got %d", want, got)
 		}
 	})
+}
+
+// TestCheckSARIFRuleAttribution runs real Rego policies containing several
+// deny/warn rule names in one namespace and verifies that the SARIF output
+// keeps one distinct rule per Rego rule, with ruleIndex and metadata
+// attributed to the rule that produced each violation. This guards the shared
+// rule identity used by both the JSON metadata and the SARIF renderer.
+func TestCheckSARIFRuleAttribution(t *testing.T) {
+	ctx := t.Context()
+
+	policySource := []byte(`package main
+
+deny_labels contains msg if {
+	msg := "same message"
+}
+
+deny_replicas contains result if {
+	result := {
+		"msg": "same message",
+		"severity": "high",
+		"_loc": {"file": "config.yaml", "line": 42}
+	}
+}
+
+warn_deprecated contains msg if {
+	msg := "same message"
+}
+`)
+
+	files := fstest.MapFS{
+		"policy.rego": &fstest.MapFile{Data: policySource},
+	}
+	l := loader.NewFileLoader().WithFS(files)
+	pols, err := l.All([]string{"policy.rego"})
+	if err != nil {
+		t.Fatalf("load policies: %v", err)
+	}
+
+	compiler := ast.NewCompiler().WithEnablePrintStatements(true)
+	compiler.Compile(pols.ParsedModules())
+	if compiler.Failed() {
+		t.Fatalf("compile policies: %v", compiler.Errors)
+	}
+
+	engine := Engine{
+		modules:  pols.ParsedModules(),
+		compiler: compiler,
+	}
+
+	results, err := engine.Check(ctx, map[string]any{"config.yaml": map[string]any{"kind": "Deployment"}}, "main")
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := output.NewSARIF(&buf).Output(results); err != nil {
+		t.Fatalf("render sarif: %v", err)
+	}
+
+	var report sarif.Report
+	if err := json.Unmarshal(buf.Bytes(), &report); err != nil {
+		t.Fatalf("parse sarif: %v", err)
+	}
+	run := report.Runs[0]
+
+	wantRuleIDs := []string{"main/deny_labels", "main/deny_replicas", "main/warn_deprecated"}
+	if len(run.Tool.Driver.Rules) != len(wantRuleIDs) {
+		t.Fatalf("got %d rules %v, want %v", len(run.Tool.Driver.Rules), run.Tool.Driver.Rules, wantRuleIDs)
+	}
+
+	ruleIndex := make(map[string]int, len(wantRuleIDs))
+	for i, rule := range run.Tool.Driver.Rules {
+		ruleIndex[rule.ID] = i
+		query := fmt.Sprint(rule.Properties["query"])
+		wantQuery := "data." + strings.Replace(rule.ID, "/", ".", 1)
+		if query != wantQuery {
+			t.Errorf("rule %q query metadata = %q, want %q", rule.ID, query, wantQuery)
+		}
+	}
+	for _, id := range wantRuleIDs {
+		if _, ok := ruleIndex[id]; !ok {
+			t.Errorf("missing rule %q in SARIF rules", id)
+		}
+	}
+
+	if len(run.Results) != 3 {
+		t.Fatalf("got %d results, want 3", len(run.Results))
+	}
+	seen := make(map[string]bool)
+	for _, sarifResult := range run.Results {
+		id := *sarifResult.RuleID
+		seen[id] = true
+		if int(*sarifResult.RuleIndex) != ruleIndex[id] {
+			t.Errorf("result %q ruleIndex = %d, want %d", id, *sarifResult.RuleIndex, ruleIndex[id])
+		}
+		if id == "main/warn_deprecated" && *sarifResult.Level != "warning" {
+			t.Errorf("warning level = %q, want warning", *sarifResult.Level)
+		}
+		if id == "main/deny_replicas" {
+			region := sarifResult.Locations[0].PhysicalLocation.Region
+			if region == nil || *region.StartLine != 42 {
+				t.Errorf("deny_replicas line = %v, want 42", region)
+			}
+		}
+	}
+	for _, id := range wantRuleIDs {
+		if !seen[id] {
+			t.Errorf("no SARIF result attributed to %q", id)
+		}
+	}
+
+	if exitCode := results.ExitCode(); *run.Invocations[0].ExitCode != exitCode || exitCode != 1 {
+		t.Errorf("sarif exit code = %d, want CheckResults.ExitCode() = %d", *run.Invocations[0].ExitCode, exitCode)
+	}
 }

@@ -3,6 +3,7 @@ package output
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"testing"
@@ -582,51 +583,304 @@ func TestSARIF_Output(t *testing.T) {
 	}
 }
 
-func TestGetRuleID(t *testing.T) {
+func TestRuleIdentityRuleID(t *testing.T) {
 	tests := []struct {
-		name      string
-		namespace string
-		ruleType  string
-		want      string
+		name     string
+		identity RuleIdentity
+		want     string
 	}{
 		{
-			name:      "failure",
-			namespace: "main",
-			ruleType:  "deny",
-			want:      "main/deny",
+			name:     "plain deny keeps historical id",
+			identity: RuleIdentity{Namespace: "main", Name: "deny", Kind: ruleKindDeny},
+			want:     "main/deny",
 		},
 		{
-			name:      "warning",
-			namespace: "main",
-			ruleType:  "warn",
-			want:      "main/warn",
+			name:     "plain violation is reported as deny",
+			identity: RuleIdentity{Namespace: "main", Name: "violation", Kind: ruleKindDeny},
+			want:     "main/deny",
 		},
 		{
-			name:      "success",
-			namespace: "main",
-			ruleType:  "success",
-			want:      "main/success",
+			name:     "plain warn keeps historical id",
+			identity: RuleIdentity{Namespace: "main", Name: "warn", Kind: ruleKindWarn},
+			want:     "main/warn",
 		},
 		{
-			name:      "skipped",
-			namespace: "main",
-			ruleType:  "skip",
-			want:      "main/skip",
+			name:     "named deny rule uses full rego name",
+			identity: RuleIdentity{Namespace: "main", Name: "deny_tags", Kind: ruleKindDeny},
+			want:     "main/deny_tags",
 		},
 		{
-			name:      "different namespace",
-			namespace: "kubernetes",
-			ruleType:  "deny",
-			want:      "kubernetes/deny",
+			name:     "named violation rule uses full rego name",
+			identity: RuleIdentity{Namespace: "main", Name: "violation_critical", Kind: ruleKindDeny},
+			want:     "main/violation_critical",
+		},
+		{
+			name:     "named warn rule uses full rego name",
+			identity: RuleIdentity{Namespace: "main", Name: "warn_deprecated", Kind: ruleKindWarn},
+			want:     "main/warn_deprecated",
+		},
+		{
+			name:     "different namespace",
+			identity: RuleIdentity{Namespace: "kubernetes", Name: "deny", Kind: ruleKindDeny},
+			want:     "kubernetes/deny",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := getRuleID(tt.namespace, tt.ruleType); got != tt.want {
-				t.Errorf("getRuleID() = %v, want %v", got, tt.want)
+			if got := tt.identity.RuleID(); got != tt.want {
+				t.Errorf("RuleID() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResultIdentity(t *testing.T) {
+	tests := []struct {
+		name      string
+		result    Result
+		namespace string
+		fallback  string
+		want      RuleIdentity
+	}{
+		{
+			name: "named deny rule is resolved from query",
+			result: Result{
+				Message:  "boom",
+				Metadata: map[string]any{"query": "data.main.deny_tags"},
+			},
+			namespace: "main",
+			fallback:  ruleKindDeny,
+			want:      RuleIdentity{Namespace: "main", Name: "deny_tags", Kind: ruleKindDeny},
+		},
+		{
+			name: "named warn rule is resolved from query",
+			result: Result{
+				Message:  "careful",
+				Metadata: map[string]any{"query": "data.kube.warn_deprecated", "rule": "x"},
+			},
+			namespace: "kube",
+			fallback:  ruleKindWarn,
+			want:      RuleIdentity{Namespace: "kube", Name: "warn_deprecated", Kind: ruleKindWarn},
+		},
+		{
+			name: "plain deny query maps to deny kind",
+			result: Result{
+				Message:  "boom",
+				Metadata: map[string]any{"query": "data.main.deny"},
+			},
+			namespace: "main",
+			fallback:  ruleKindDeny,
+			want:      RuleIdentity{Namespace: "main", Name: "deny", Kind: ruleKindDeny},
+		},
+		{
+			name:      "missing metadata falls back to namespace and kind",
+			result:    Result{Message: "boom"},
+			namespace: "main",
+			fallback:  ruleKindDeny,
+			want:      RuleIdentity{Namespace: "main", Name: "", Kind: ruleKindDeny},
+		},
+		{
+			name: "success placeholder falls back to success kind",
+			result: Result{
+				Message:  successDesc,
+				Metadata: map[string]any{"description": successDesc},
+			},
+			namespace: "main",
+			fallback:  ruleKindSuccess,
+			want:      RuleIdentity{Namespace: "main", Name: "", Kind: ruleKindSuccess},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.result.identity(tt.namespace, tt.fallback)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("identity() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestSARIF_RuleAttribution ensures that distinct Rego rules in the same
+// namespace produce distinct SARIF rules with stable rule indices, and that
+// each violation is attributed to the rule that actually produced it. This is
+// the regression test for rules previously collapsed into a single
+// "namespace/deny" entry whose metadata came from the first rule only.
+func TestSARIF_RuleAttribution(t *testing.T) {
+	results := CheckResults{
+		{
+			FileName:  "deployment.yaml",
+			Namespace: "main",
+			Failures: []Result{
+				{
+					Message: "same message",
+					Metadata: map[string]any{
+						"query": "data.main.deny_labels",
+						"rule":  "labels",
+					},
+					Location: &Location{File: "deployment.yaml", Line: json.Number("10")},
+				},
+				{
+					Message: "same message",
+					Metadata: map[string]any{
+						"query": "data.main.deny_replicas",
+						"rule":  "replicas",
+					},
+					Location: &Location{File: "deployment.yaml", Line: json.Number("42")},
+				},
+			},
+			Warnings: []Result{
+				{
+					Message: "same message",
+					Metadata: map[string]any{
+						"query": "data.main.warn_deprecated",
+						"rule":  "deprecated",
+					},
+					Location: &Location{File: "deployment.yaml", Line: json.Number("7")},
+				},
+			},
+		},
+		{
+			FileName:  "service.yaml",
+			Namespace: "main",
+			Failures: []Result{
+				{
+					// A second occurrence of the first rule, in another file,
+					// must reuse the existing rule and its index.
+					Message:  "another failure",
+					Metadata: map[string]any{"query": "data.main.deny_labels"},
+				},
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := NewSARIF(&buf).Output(results); err != nil {
+		t.Fatal(err)
+	}
+
+	var report sarif.Report
+	if err := json.Unmarshal(buf.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	run := report.Runs[0]
+
+	wantRules := map[string]map[string]any{
+		"main/deny_labels":     {"index": uint(0), "rule": "labels", "query": "data.main.deny_labels", "level": "error", "desc": failureDesc},
+		"main/deny_replicas":   {"index": uint(1), "rule": "replicas", "query": "data.main.deny_replicas", "level": "error", "desc": failureDesc},
+		"main/warn_deprecated": {"index": uint(2), "rule": "deprecated", "query": "data.main.warn_deprecated", "level": "warning", "desc": warningDesc},
+	}
+	if len(run.Tool.Driver.Rules) != len(wantRules) {
+		t.Fatalf("got %d rules, want %d: %#v", len(run.Tool.Driver.Rules), len(wantRules), run.Tool.Driver.Rules)
+	}
+	for ruleIndex, rule := range run.Tool.Driver.Rules {
+		want, ok := wantRules[rule.ID]
+		if !ok {
+			t.Errorf("unexpected rule %q", rule.ID)
+			continue
+		}
+		if uint(ruleIndex) != want["index"] {
+			t.Errorf("rule %q position = %d, want %v", rule.ID, ruleIndex, want["index"])
+		}
+		if *rule.ShortDescription.Text != want["desc"] {
+			t.Errorf("rule %q description = %q, want %q", rule.ID, *rule.ShortDescription.Text, want["desc"])
+		}
+		if got := fmt.Sprint(rule.Properties["rule"]); got != want["rule"] {
+			t.Errorf("rule %q properties.rule = %v, want %v", rule.ID, got, want["rule"])
+		}
+		if got := fmt.Sprint(rule.Properties["query"]); got != want["query"] {
+			t.Errorf("rule %q query metadata = %v, want %v", rule.ID, got, want["query"])
+		}
+	}
+
+	type expectation struct {
+		ruleID string
+		index  uint
+		level  string
+		line   int
+		file   string
+	}
+	wantResults := []expectation{
+		{ruleID: "main/deny_labels", index: 0, level: "error", line: 10, file: "deployment.yaml"},
+		{ruleID: "main/deny_replicas", index: 1, level: "error", line: 42, file: "deployment.yaml"},
+		{ruleID: "main/warn_deprecated", index: 2, level: "warning", line: 7, file: "deployment.yaml"},
+		{ruleID: "main/deny_labels", index: 0, level: "error", line: 0, file: "service.yaml"},
+	}
+	if len(run.Results) != len(wantResults) {
+		t.Fatalf("got %d results, want %d", len(run.Results), len(wantResults))
+	}
+	for i, want := range wantResults {
+		got := run.Results[i]
+		if *got.RuleID != want.ruleID {
+			t.Errorf("result %d ruleId = %q, want %q", i, *got.RuleID, want.ruleID)
+		}
+		if *got.RuleIndex != want.index {
+			t.Errorf("result %d ruleIndex = %d, want %d", i, *got.RuleIndex, want.index)
+		}
+		if *got.Level != want.level {
+			t.Errorf("result %d level = %q, want %q", i, *got.Level, want.level)
+		}
+		location := got.Locations[0].PhysicalLocation
+		if *location.ArtifactLocation.URI != want.file {
+			t.Errorf("result %d file = %q, want %q", i, *location.ArtifactLocation.URI, want.file)
+		}
+		if want.line != 0 && *location.Region.StartLine != want.line {
+			t.Errorf("result %d line = %d, want %d", i, *location.Region.StartLine, want.line)
+		}
+	}
+
+	invocation := run.Invocations[0]
+	if *invocation.ExitCode != results.ExitCode() || *invocation.ExitCode != 1 {
+		t.Errorf("exit code = %d, want 1 (matching CheckResults.ExitCode)", *invocation.ExitCode)
+	}
+	if *invocation.ExecutionSuccessful != true {
+		t.Errorf("executionSuccessful = %v, want true", *invocation.ExecutionSuccessful)
+	}
+}
+
+// TestSARIF_JSONAndSARIFShareRuleIdentity verifies that the rule identity
+// driving SARIF is derived from the same metadata that is serialised in the
+// JSON output, so both formats trace a violation back to the same Rego rule.
+func TestSARIF_JSONAndSARIFShareRuleIdentity(t *testing.T) {
+	result := Result{
+		Message:  "boom",
+		Metadata: map[string]any{"query": "data.main.deny_tags", "severity": "high"},
+	}
+	results := CheckResults{{
+		FileName: "test.yaml", Namespace: "main", Failures: []Result{result},
+	}}
+
+	var jsonBuf, sarifBuf bytes.Buffer
+	if err := NewJSON(&jsonBuf).Output(results); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewSARIF(&sarifBuf).Output(results); err != nil {
+		t.Fatal(err)
+	}
+
+	var jsonOutput CheckResults
+	if err := json.Unmarshal(jsonBuf.Bytes(), &jsonOutput); err != nil {
+		t.Fatal(err)
+	}
+	jsonQuery, _ := jsonOutput[0].Failures[0].Metadata["query"].(string)
+
+	var report sarif.Report
+	if err := json.Unmarshal(sarifBuf.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	rule := report.Runs[0].Tool.Driver.Rules[0]
+	sarifQuery := fmt.Sprint(rule.Properties["query"])
+
+	if sarifQuery != jsonQuery {
+		t.Errorf("SARIF rule query %q does not match JSON metadata query %q", sarifQuery, jsonQuery)
+	}
+	wantID := "main/deny_tags"
+	if rule.ID != wantID {
+		t.Errorf("rule id = %q, want %q derived from shared query %q", rule.ID, wantID, jsonQuery)
+	}
+	if *report.Runs[0].Results[0].RuleIndex != 0 {
+		t.Errorf("ruleIndex = %d, want 0", *report.Runs[0].Results[0].RuleIndex)
 	}
 }
 

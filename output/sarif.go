@@ -43,51 +43,59 @@ func NewSARIF(w io.Writer) *SARIF {
 	}
 }
 
-// getRuleID generates a stable rule ID based on namespace and rule type
-func getRuleID(namespace string, ruleType string) string {
-	return fmt.Sprintf("%s/%s", namespace, ruleType)
-}
-
-// getRuleDescription returns the appropriate description based on the rule type
-func getRuleDescription(ruleID string) string {
-	switch {
-	case strings.HasSuffix(ruleID, "/success"):
+// getRuleDescription returns the appropriate description based on the rule kind.
+func getRuleDescription(kind string) string {
+	switch kind {
+	case ruleKindSuccess:
 		return successDesc
-	case strings.HasSuffix(ruleID, "/skip"):
+	case ruleKindSkip:
 		return skippedDesc
-	case strings.HasSuffix(ruleID, "/allow"):
+	case ruleKindAllow:
 		return exceptionDesc
-	case strings.HasSuffix(ruleID, "/warn"):
+	case ruleKindWarn:
 		return warningDesc
 	default:
 		return failureDesc
 	}
 }
 
-// addRuleIndex adds a new rule to the SARIF run and returns its index.
-func addRuleIndex(run *sarif.Run, ruleID string, result Result, indices map[string]int) int {
-	addRule(run, ruleID, result)
+// ruleRegistry keeps the mapping between stable rule IDs and their position in
+// the SARIF tool driver rule array. Tracking indices explicitly ensures that
+// every result points at the rule describing the exact Rego rule that produced
+// it, even when several rules share a namespace or produce identical messages.
+type ruleRegistry struct {
+	indices map[string]int
+}
+
+func newRuleRegistry() ruleRegistry {
+	return ruleRegistry{indices: make(map[string]int)}
+}
+
+// index returns the rule index for the given identity, registering the rule
+// (including its result metadata) the first time it is encountered.
+func (r ruleRegistry) index(run *sarif.Run, identity RuleIdentity, result Result) int {
+	ruleID := identity.RuleID()
+	if idx, ok := r.indices[ruleID]; ok {
+		return idx
+	}
+
+	desc := getRuleDescription(identity.Kind)
+	run.AddRule(ruleID).
+		WithDescription(desc).
+		WithProperties(sarif.Properties(result.Metadata)).
+		WithShortDescription(sarif.NewMultiformatMessageString(desc))
+
 	idx := len(run.Tool.Driver.Rules) - 1
-	indices[ruleID] = idx
+	r.indices[ruleID] = idx
 	return idx
 }
 
-// addRule adds a new rule to the SARIF run with the given ID and result metadata.
-func addRule(run *sarif.Run, ruleID string, result Result) {
-	desc := getRuleDescription(ruleID)
-	run.AddRule(ruleID).
-		WithDescription(desc).
-		WithProperties(result.Metadata).
-		WithShortDescription(sarif.NewMultiformatMessageString(desc))
-}
-
-// addResult adds a result to the SARIF run
-func addResult(run *sarif.Run, result Result, namespace, ruleType, level, fileName string, indices map[string]int) {
-	ruleID := getRuleID(namespace, ruleType)
-	idx, ok := indices[ruleID]
-	if !ok {
-		idx = addRuleIndex(run, ruleID, result, indices)
-	}
+// addResult adds a result to the SARIF run, attributing it to the stable rule
+// identity derived from the result itself.
+func addResult(run *sarif.Run, result Result, namespace, kind, level, fileName string, registry ruleRegistry) {
+	identity := result.identity(namespace, kind)
+	ruleID := identity.RuleID()
+	idx := registry.index(run, identity, result)
 
 	location := sarif.NewPhysicalLocation()
 	if loc := result.Location; loc != nil {
@@ -116,23 +124,23 @@ func (s *SARIF) Output(results CheckResults) error {
 	toolVersion := strings.TrimPrefix(version.Version, "v")
 	driver := sarif.NewVersionedDriver(toolName, toolVersion).WithInformationURI(toolURI)
 	run := sarif.NewRun(sarif.Tool{Driver: driver})
-	indices := make(map[string]int)
+	registry := newRuleRegistry()
 
 	for _, result := range results {
 		// Process failures
 		for _, failure := range result.Failures {
-			addResult(run, failure, result.Namespace, "deny", "error", result.FileName, indices)
+			addResult(run, failure, result.Namespace, ruleKindDeny, "error", result.FileName, registry)
 		}
 
 		// Process warnings
 		for _, warning := range result.Warnings {
-			addResult(run, warning, result.Namespace, "warn", "warning", result.FileName, indices)
+			addResult(run, warning, result.Namespace, ruleKindWarn, "warning", result.FileName, registry)
 		}
 
 		// Process exceptions (treated as successes)
 		hasSuccesses := result.Successes > 0
 		for _, exception := range result.Exceptions {
-			addResult(run, exception, result.Namespace, "allow", "note", result.FileName, indices)
+			addResult(run, exception, result.Namespace, ruleKindAllow, "note", result.FileName, registry)
 			hasSuccesses = true
 		}
 
@@ -150,7 +158,7 @@ func (s *SARIF) Output(results CheckResults) error {
 					"description": successDesc,
 				},
 			}
-			addResult(run, statusResult, result.Namespace, "success", "none", result.FileName, indices)
+			addResult(run, statusResult, result.Namespace, ruleKindSuccess, "none", result.FileName, registry)
 		} else {
 			statusResult := Result{
 				Message: skippedDesc,
@@ -158,7 +166,7 @@ func (s *SARIF) Output(results CheckResults) error {
 					"description": skippedDesc,
 				},
 			}
-			addResult(run, statusResult, result.Namespace, "skip", "none", result.FileName, indices)
+			addResult(run, statusResult, result.Namespace, ruleKindSkip, "none", result.FileName, registry)
 		}
 	}
 
